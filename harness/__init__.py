@@ -4,4 +4,4 @@ This package is intentionally minimal at first. Each phase adds ONE
 capability and keeps everything runnable. See README.md for the roadmap.
 """
 
-__version__ = "0.0.1"
+__version__ = "0.6.0"

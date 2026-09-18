@@ -58,7 +58,9 @@ class Engine:
                  executor: Optional[ToolExecutor] = None,
                  guardrails: Optional[Guardrails] = None,
                  model_name: str = "dummy",
-                 tracer: Optional[Tracer] = None):
+                 tracer: Optional[Tracer] = None,
+                 critic: Optional[Critic] = None,
+                 max_reflections: int = 3):
         self.model = model
         self.registry = registry
         self.max_steps = max_steps
@@ -77,6 +79,11 @@ class Engine:
         # Phase 5: every measured unit of work lands here (and, when a store is
         # present, also as a durable 'span' event).
         self.tracer = tracer or Tracer()
+        # Phase 6: the critic judges the agent's own behavior; max_reflections
+        # caps how many times we re-plan in response before letting it proceed.
+        self.critic = critic
+        self.max_reflections = max_reflections
+        self._reflections = 0
         self.last_task_id: Optional[str] = None
         self._last_store: Optional[StateStore] = None
 
@@ -95,6 +102,7 @@ class Engine:
         messages, task_id = self._build_messages(prompt, task_id, store)
         self.last_task_id = task_id
         self._last_store = store
+        self._reflections = 0  # reset reflection budget per run (incl. resume)
 
         # Phase 4: if guardrails are on, arm the durable store's redactor so
         # EVERY event written from here on (messages, tool results, guardrail
@@ -140,6 +148,27 @@ class Engine:
                 if store:
                     store.set_status(task_id, "crashed")
                 raise SimulatedCrash(task_id, step)
+
+            # ---- PHASE 6: reflection / self-correction --------------------
+            # The critic judges the agent's OWN last step. If it objects, we
+            # append its note as a USER message and re-call the model WITHOUT
+            # running the tool calls - the agent re-plans. This is the exact
+            # same "append a message, call the model again" move as failure
+            # recovery (Phase 3); only the trigger changed from a tool error to
+            # a judgment about the agent's behavior. max_reflections caps the
+            # loop so a stubborn agent eventually proceeds or answers.
+            if self.critic is not None and self._reflections < self.max_reflections:
+                critique = self.critic.review(messages, resp, store, task_id)
+                if not critique.ok:
+                    print(f"  [critic] {critique.kind}: {critique.reason}")
+                    messages.append(Message(
+                        Role.USER, content=f"[Critic] {critique.reason}"))
+                    if store:
+                        store.append(task_id, "reflection", {
+                            "kind": critique.kind, "reason": critique.reason,
+                        })
+                    self._reflections += 1
+                    continue
 
             if not resp.tool_calls:
                 if store:

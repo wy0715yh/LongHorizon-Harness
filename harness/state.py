@@ -17,6 +17,7 @@ Tables
 ------
   tasks  : one row per run (status, timestamps, free-form meta)
   events : append-only log; payload is JSON. This IS the agent's memory.
+  errors : durable failure counts per tool (Phase 6 error memory). Cross-task.
 
 Why SQLite?
   * ships with Python stdlib (zero third-party deps),
@@ -106,6 +107,13 @@ class StateStore:
                 ts      REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, seq);
+            CREATE TABLE IF NOT EXISTS errors (
+                tool       TEXT NOT NULL,
+                error_type TEXT NOT NULL,
+                n          INTEGER NOT NULL,
+                last_at    REAL NOT NULL,
+                PRIMARY KEY(tool, error_type)
+            );
             """
         )
         self._conn.commit()
@@ -167,6 +175,33 @@ class StateStore:
             {"seq": r[0], "type": r[1], "payload": json.loads(r[2]), "ts": r[3]}
             for r in rows
         ]
+
+    # ----------------------------------------------- Phase 6: error memory
+    def record_error(self, tool: str, error_type: str) -> None:
+        """Durably count a failed tool call. Upsert on (tool, error_type).
+
+        This is the agent's *memory of past failures*: it survives across steps,
+        tasks and even process crashes, so the Critic can warn against blindly
+        re-calling a tool that keeps blowing up."""
+        now = _now()
+        self._conn.execute(
+            "INSERT INTO errors(tool,error_type,n,last_at) VALUES(?,?,1,?) "
+            "ON CONFLICT(tool,error_type) DO UPDATE SET n=n+1, last_at=?",
+            (tool, error_type, now, now),
+        )
+        self._conn.commit()
+
+    def error_count(self, tool: str) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(n),0) FROM errors WHERE tool=?", (tool,)
+        ).fetchone()
+        return int(row[0])
+
+    def error_stats(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT tool, error_type, n FROM errors ORDER BY n DESC"
+        ).fetchall()
+        return [{"tool": r[0], "error_type": r[1], "n": r[2]} for r in rows]
 
     # ------------------------------------------------- replay = the recovery core
     def load_messages(self, task_id: str) -> list[Message]:
