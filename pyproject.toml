@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "harness"
+version = "0.0.1"
+description = "A lightweight, reliable Agent execution runtime - built phase by phase"
+requires-python = ">=3.10"
+# P0: zero RUNTIME dependencies. We add deps only when a later phase needs them
+# (e.g. httpx for the real model client, prometheus-client for metrics).
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["harness*"]
