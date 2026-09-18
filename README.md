@@ -1,5 +1,7 @@
 # Agent Harness
 
+> 项目地址：https://github.com/wy0715yh/LongHorizon-Harness
+
 一个**从零开始、分阶段搭建**的轻量级可靠 Agent 运行时。每一阶段都产出可运行
 代码，并解释"为什么这么写"。目标：最终具备行为规范、反思纠错、熔断限流等
 进阶能力，对标主流生产级 Agent 运行时（如 dsh）。
