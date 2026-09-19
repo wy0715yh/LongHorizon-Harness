@@ -25,6 +25,7 @@ Design choices worth internalising
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -69,19 +70,25 @@ class Span:
 
 
 class Tracer:
-    """Collects spans for one Engine instance."""
+    """Collects spans for one Engine instance.
+
+    Phase 8: a lock makes span recording safe when several tool calls run in
+    parallel worker threads and each appends its own span."""
 
     def __init__(self) -> None:
         self.spans: list[Span] = []
+        self._lock = threading.Lock()
 
     def record(self, span: Span) -> None:
-        self.spans.append(span)
+        with self._lock:
+            self.spans.append(span)
 
     def span(self, name: str, kind: str, start: float, end: float,
              attributes: Optional[dict] = None, status: str = "ok") -> Span:
         s = Span(name, kind, start, end, (end - start) * 1000,
                  attributes or {}, status)
-        self.spans.append(s)
+        with self._lock:
+            self.spans.append(s)
         return s
 
     # ----------------------------------------------------------------- summary

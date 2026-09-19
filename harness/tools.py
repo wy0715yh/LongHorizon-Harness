@@ -43,9 +43,14 @@ from .types import ToolCall, ToolResult, ToolSpec
 class Tool:
     """One callable capability."""
 
-    def __init__(self, spec: ToolSpec, fn: Callable[[dict], object]):
+    def __init__(self, spec: ToolSpec, fn: Callable[[dict], object],
+                 human: bool = False):
         self.spec = spec
         self.fn = fn
+        # Phase 8: when True the engine PAUSES and asks a human for the answer
+        # instead of running ``fn``. The flag is metadata only - the engine
+        # reads it; ``fn`` is never called for a human tool.
+        self.human = human
 
     def run(self, call: ToolCall) -> ToolResult:
         """Execute and NEVER let a tool exception kill the agent.
@@ -64,8 +69,9 @@ class ToolRegistry:
         self._tools: dict[str, Tool] = {}
 
     def register(self, name: str, description: str, parameters: dict,
-                 fn: Callable[[dict], object]) -> None:
-        self._tools[name] = Tool(ToolSpec(name, description, parameters), fn)
+                 fn: Callable[[dict], object], human: bool = False) -> None:
+        self._tools[name] = Tool(ToolSpec(name, description, parameters), fn,
+                                 human=human)
 
     def get(self, name: str):
         return self._tools.get(name)

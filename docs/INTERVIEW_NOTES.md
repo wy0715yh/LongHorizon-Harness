@@ -1,13 +1,13 @@
 # LongHorizon-Harness 面试速记 / 设计精华
 
 > **用途**：面试时讲清「这个项目为什么这么设计、每一层解决什么问题、背后是什么工程思想」。
-> **维护约定**：本文件随项目迭代持续追加。每完成一个 Phase（P6+），就在「分阶段精华」里补一节，并在末尾「后续阶段」勾掉对应项。当前覆盖 **P0–P7**。
+> **维护约定**：本文件随项目迭代持续追加。每完成一个 Phase（P6+），就在「分阶段精华」里补一节，并在末尾「后续阶段」勾掉对应项。当前覆盖 **P0–P8**。
 
 ---
 
 ## 0. 一句话电梯演讲（背下来）
 
-> 我构建了一个面向**边缘/资源受限环境**的轻量级 Agent 运行时，只用 Python 标准库、零第三方依赖，在单 SQLite 文件上落地了**工具调用失败恢复、任务状态崩溃续跑、执行轨迹可观测**三项生产级工程能力，并进一步具备行为规范护栏、**反思自我纠错**，以及面向工具依赖与模型 API 的**熔断、限流与背压**三道弹性防线。
+> 我构建了一个面向**边缘/资源受限环境**的轻量级 Agent 运行时，只用 Python 标准库、零第三方依赖，在单 SQLite 文件上落地了**工具调用失败恢复、任务状态崩溃续跑、执行轨迹可观测**三项生产级工程能力，并进一步具备行为规范护栏、**反思自我纠错**、面向依赖与 API 的**熔断/限流/背压**三道弹性防线，以及**高级编排**（并行工具、人在环、子任务委派、流式输出）能力。
 
 **为什么是差异化选题**：主流框架（LangGraph / AutoGen / CrewAI）默认假设有云 GPU 和无限内存；本报告切的是它们照顾不好的「轻量 + 可靠」场景，讲的可不是「又包一层聊天机器人」，而是 Agent 真实的工程痛点。
 
@@ -104,6 +104,17 @@
 - **可讲的设计张力（面试加分）**：背压「丢弃」语义很容易写错成「丢旧的腾地方」——但本框架下引擎已承诺本回合要跑那些已准入的调用，丢旧的会静默丢工作。正确语义是「满了就拒绝新调用（返回 False），由引擎转软失败」。这就是 `circuit_demo.py` 里一个真实踩坑：最初 `admit()` 永远返回 True，背压形同虚设，修正后才真正 shed。
 - **验证铁证（`circuit_demo.py`）**：A) `boom` 连续失败 2 次 → 熔断 OPEN、fast-fail 1 次、模型改 `calculator` 出 42、且 `store.error_count('boom')>=1`；A2) 虚拟时钟跑通状态机 CLOSED→OPEN→HALF_OPEN→CLOSED；B) 令牌桶容量 2 取 5 个令牌需等 1.5s 虚拟时间、引擎 ratelimit span 记录到等待；C) 5 并发 echo / maxsize=2 → 3 个被 shed、软失败回灌、模型重试直到 `all 5 done`。
 
+### P8 高级编排 — 并行工具 / 人在环 / 子任务委派 / 流式
+**文件**：`orchestration.py`（`execute_calls` / `Delegate` / `HumanInput`）+ `engine.py`（gate→execute→commit 三段式工具循环、`_call_model` 流式、`_ask_human`）+ `tools.py`（`Tool.human`）+ `models.py`（`chat_stream`）+ `state.py`/`tracing.py`（线程安全改造）
+
+- **全局决策：把「编排」拆成主循环上的三段式工具处理**，而不是另起一套调度器。**每回合工具调用 = PASS1 准入(GATE，串行) → PASS2 执行(EXECUTE，可并行) → PASS3 落盘(COMMIT，主线程)**。这个拆分是 P8 四个能力全部能干净挂上的关键骨架。
+- **能力①：并行工具（`execute_calls`，线程池）**。模型一次发出多个**互相独立**的工具调用时，用 `ThreadPoolExecutor` 并发跑，墙钟时间从「N×单调用」降到「≈1×单调用」。`orchestration_demo.py` 实测 3 个各睡 0.1s 的慢调用：串行 0.30s、并行 0.10s（~3× 加速）。**关键边界**：准入闸门（护栏/熔断/背压）仍是**串行**的——只有「执行」并行；结果回主线程**顺序落盘**，对话日志保持单写者，所以并发写安全（靠 P8 给 `StateStore`/`Tracer` 加的锁 + `check_same_thread=False`）。
+- **能力②：人在环（`Tool.human=True` + `_ask_human`）**。工具注册时标 `human=True`，模型一旦调它，引擎**暂停自主循环**、调用 `human_input(question, args)` 回调要答案，再把答案作为 `TOOL` 消息回灌——agent 懂得「何时该停下来问人」。回调默认 `input()`（真实 TTY 交互），没接回调则返回结构化 `HUMAN INPUT UNAVAILABLE` 优雅降级，绝不崩。这正是「human-in-the-loop」的本质：不是全自主，而是知道何时求助。
+- **能力③：子任务委派（`Delegate` 元工具 / 嵌套 Engine）**。模型调 `delegate` 工具（参数 `sub_prompt`），引擎**起一个嵌套 Engine** 跑子任务、把最终答案折回主对话。这是**分层规划（hierarchical planning）**：boss 拆解、委派、汇总。嵌套引擎被刻意做成**叶子节点**——不递归委派、无 Critic、无流式、且**内存态无持久化**——保证永不无限递归、子任务有界。父引擎只记一个 `delegate` span，子任务内部全被一条 `TOOL` 消息藏住。
+- **能力④：流式输出（`Model.chat_stream` + `_call_model`）**。`Model` 增加 `chat_stream` 默认实现（一次性 yield 完整消息），真模型可覆盖成 SSE 分片；`_call_model` 在 `stream=True` 时逐 delta 打印并**现场拼回**最终 `Message`，`tool_calls`/`usage` 以**最后一个 delta** 为准。主循环其余逻辑与离线调用完全同构——流式只是「拿消息」的方式变了。
+- **设计张力（面试加分）**：并行执行最容易踩的坑是「并发写持久化层」。本项目没为了并行去改事件日志语义，而是给 `StateStore`/`Tracer` 加锁并放开 `check_same_thread`，让并行 worker 各写各的 `tool_attempt`/`tool` span 仍安全——**线程池只在「执行」这一段，落盘始终主线程**，既拿到并发加速又不破坏事件溯源的单写者不变式。委派同理：子任务不碰父 store，避免嵌套任务簿记与跨线程写。
+- **验证铁证（`orchestration_demo.py`）**：A) 3 慢调用并行 ~3× 加速；B) 模型调 `confirm(human=True)` → 引擎暂停、`human_input` 返回 `yes, approved` → 答案回灌、继续；C) boss 调 `delegate` → 嵌套引擎算出 42 并折回、boss 出 `boss final: ...42`；D) `stream=True` 下最终回答逐字打印且拼装正确。
+
 ---
 
 ## 4. 贯穿全局的设计哲学（面试金句）
@@ -139,13 +150,19 @@ A：目标场景是边缘/受限环境，要求常驻内存极低、无外部服
 **Q：模型抽象怎么设计的？**
 A：`Model` 抽象基类 + 具体实现（离线 `DummyModel` 学主循环，后续 `OpenAICompatibleModel`）。引擎面向接口编程，换后端零改引擎——依赖倒置。Critic 同理：引擎只依赖 `Critic` 接口，规则版和 LLM 版可换。
 
+**Q：多个工具调用你怎么并发 / 怎么让人介入 / 怎么做分层？**
+A：都挂在 P8 的「gate→execute→commit」三段式工具循环上。并发：互相独立的调用丢进线程池跑，准入闸门仍串行、结果回主线程顺序落盘——既加速又不破坏事件溯源单写者不变式（持久化层为此加了锁）。人在环：工具标 `human=True`，引擎暂停调 `human_input` 回调取答案再回灌，而非永远自主。分层：模型调 `delegate` 元工具时引擎起嵌套 Engine 跑子任务并把答案折回，嵌套引擎是叶子、不递归、内存态，保证有界。流式：`chat_stream` 逐 delta 打印并拼回消息，主循环其余逻辑同构。
+
+**Q：并行执行怎么保证线程安全？**
+A：事件日志与 trace 都是共享状态，原本单线程写。P8 让工具执行进线程池，于是给 `StateStore` 加 `threading.RLock` 并放开 `check_same_thread=False`、给 `Tracer` 的 span 记录加锁，worker 各写各的事件/span 仍安全；而「把结果折回对话 + 落盘 tool_result/message」只发生在主线程，所以对话顺序确定、不竞态。这比「为并行改事件溯源语义」小得多、稳得多。
+
 ---
 
 ## 6. 后续阶段（待补充，完成后在此追加小节并勾掉）
 
 - [x] **P6 反思与自我纠错** — Critic 评审 / 自省重规划 / 错误记忆（把 P3/P4「失败回灌模型」升级成「模型自己批评自己」）
 - [x] **P7 熔断与限流** — 单工具熔断器（CLOSED/OPEN/HALF_OPEN）/ 模型级令牌桶限流 / 背压队列 shed 溢出
-- [ ] **P8 高级编排** — 子任务委派 / 并行工具 / 人在环 / 流式
+- [x] **P8 高级编排** — 并行工具（线程池）/ 人在环（human_input 暂停）/ 子任务委派（嵌套 Engine）/ 流式（chat_stream）
 - [ ] **P9 服务化与评测** — CLI / HTTP 服务 / 基准测试（量化冷启动、内存峰值、恢复耗时）
 
-> 更新日志：2026-09-18 创建，覆盖 P0–P5；20:45 补充 P6（反思与自我纠错：Critic / 循环检测 / 错误记忆 / 自省重规划）；2026-09-19 补充 P7（熔断与限流：CircuitBreaker / RateLimiter 令牌桶 / BackpressureQueue 背压 shed）。
+> 更新日志：2026-09-18 创建，覆盖 P0–P5；20:45 补充 P6（反思与自我纠错：Critic / 循环检测 / 错误记忆 / 自省重规划）；2026-09-19 补充 P7（熔断与限流：CircuitBreaker / RateLimiter 令牌桶 / BackpressureQueue 背压 shed）；2026-09-19 补充 P8（高级编排：gate→execute→commit 三段式工具循环 / execute_calls 线程池并行 / Tool.human 人在环 / Delegate 嵌套引擎委派 / Model.chat_stream 流式 / StateStore·Tracer 线程安全）。

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from typing import Any, Optional
@@ -82,7 +83,12 @@ class StateStore:
     def __init__(self, path: str = "harness.db", redactor=None):
         self.path = path
         self.redactor = redactor  # callable(obj)->obj, set by Phase 4 guardrails
-        self._conn = sqlite3.connect(path)
+        # Phase 8: check_same_thread=False + a lock let the SAME store be used
+        # from the engine's main thread AND the worker threads that run tool
+        # calls in parallel. SQLite is not safe for concurrent writes from
+        # different threads, so every write path below takes this lock.
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._lock = threading.RLock()
         # WAL: writes are durable, and a reader (e.g. the trace exporter) will
         # not block the writer. On a single-file edge store this matters.
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -122,34 +128,38 @@ class StateStore:
     def new_task(self, meta: Optional[dict] = None) -> str:
         task_id = uuid.uuid4().hex[:12]
         now = _now()
-        self._conn.execute(
-            "INSERT INTO tasks(task_id,status,created_at,updated_at,meta) "
-            "VALUES(?,?,?,?,?)",
-            (task_id, "running", now, now, json.dumps(meta or {})),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO tasks(task_id,status,created_at,updated_at,meta) "
+                "VALUES(?,?,?,?,?)",
+                (task_id, "running", now, now, json.dumps(meta or {})),
+            )
+            self._conn.commit()
         return task_id
 
     def exists(self, task_id: str) -> bool:
-        return (
-            self._conn.execute(
-                "SELECT 1 FROM tasks WHERE task_id=?", (task_id,)
-            ).fetchone()
-            is not None
-        )
+        with self._lock:
+            return (
+                self._conn.execute(
+                    "SELECT 1 FROM tasks WHERE task_id=?", (task_id,)
+                ).fetchone()
+                is not None
+            )
 
     def status(self, task_id: str) -> Optional[str]:
-        row = self._conn.execute(
-            "SELECT status FROM tasks WHERE task_id=?", (task_id,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
         return row[0] if row else None
 
     def set_status(self, task_id: str, status: str) -> None:
-        self._conn.execute(
-            "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
-            (status, _now(), task_id),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
+                (status, _now(), task_id),
+            )
+            self._conn.commit()
 
     # ----------------------------------------------------------------- event log
     def append(self, task_id: str, etype: str, payload: dict) -> None:
@@ -157,20 +167,23 @@ class StateStore:
 
         If a ``redactor`` was set (Phase 4), the payload is scrubbed for
         secrets before it is serialized - so nothing sensitive is ever
-        persisted."""
+        persisted. Guarded by a lock so parallel tool workers (Phase 8) can
+        each append their own event safely."""
         if self.redactor is not None:
             payload = self.redactor(payload)
-        self._conn.execute(
-            "INSERT INTO events(task_id,type,payload,ts) VALUES(?,?,?,?)",
-            (task_id, etype, json.dumps(payload, ensure_ascii=False), _now()),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO events(task_id,type,payload,ts) VALUES(?,?,?,?)",
+                (task_id, etype, json.dumps(payload, ensure_ascii=False), _now()),
+            )
+            self._conn.commit()
 
     def event_log(self, task_id: str) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT seq,type,payload,ts FROM events WHERE task_id=? ORDER BY seq",
-            (task_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq,type,payload,ts FROM events WHERE task_id=? ORDER BY seq",
+                (task_id,),
+            ).fetchall()
         return [
             {"seq": r[0], "type": r[1], "payload": json.loads(r[2]), "ts": r[3]}
             for r in rows
@@ -184,23 +197,26 @@ class StateStore:
         tasks and even process crashes, so the Critic can warn against blindly
         re-calling a tool that keeps blowing up."""
         now = _now()
-        self._conn.execute(
-            "INSERT INTO errors(tool,error_type,n,last_at) VALUES(?,?,1,?) "
-            "ON CONFLICT(tool,error_type) DO UPDATE SET n=n+1, last_at=?",
-            (tool, error_type, now, now),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO errors(tool,error_type,n,last_at) VALUES(?,?,1,?) "
+                "ON CONFLICT(tool,error_type) DO UPDATE SET n=n+1, last_at=?",
+                (tool, error_type, now, now),
+            )
+            self._conn.commit()
 
     def error_count(self, tool: str) -> int:
-        row = self._conn.execute(
-            "SELECT COALESCE(SUM(n),0) FROM errors WHERE tool=?", (tool,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(n),0) FROM errors WHERE tool=?", (tool,)
+            ).fetchone()
         return int(row[0])
 
     def error_stats(self) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT tool, error_type, n FROM errors ORDER BY n DESC"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT tool, error_type, n FROM errors ORDER BY n DESC"
+            ).fetchall()
         return [{"tool": r[0], "error_type": r[1], "n": r[2]} for r in rows]
 
     # ------------------------------------------------- replay = the recovery core

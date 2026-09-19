@@ -21,8 +21,9 @@ How the loop changed vs Phase 1:
 
 from __future__ import annotations
 
+import sys
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from .models import Model
 from .state import StateStore, message_to_dict
@@ -32,6 +33,7 @@ from .guardrails import Guardrails, validate_args
 from .tracing import Tracer, estimate_cost, spans_from_events
 from .resilience import (CircuitBreakerSet, RateLimiter, BackpressureQueue,
                          CircuitState)
+from .orchestration import execute_calls, Delegate, HumanInput
 
 
 class SimulatedCrash(Exception):
@@ -65,7 +67,11 @@ class Engine:
                  max_reflections: int = 3,
                  circuit: Optional[CircuitBreakerSet] = None,
                  rate_limiter: Optional[RateLimiter] = None,
-                 backpressure: Optional[BackpressureQueue] = None):
+                 backpressure: Optional[BackpressureQueue] = None,
+                 parallel: bool = True, max_parallel: int = 8,
+                 human_input: Optional[HumanInput] = None,
+                 delegate: Optional[Delegate] = None,
+                 stream: bool = False):
         self.model = model
         self.registry = registry
         self.max_steps = max_steps
@@ -95,6 +101,17 @@ class Engine:
         self.circuit = circuit
         self.rate_limiter = rate_limiter
         self.backpressure = backpressure
+        # Phase 8: orchestration knobs. All composable with everything above.
+        #   parallel / max_parallel - run a turn's independent tool calls in a
+        #       thread pool (execution only; admission gates stay sequential).
+        #   human_input - the callback used by human-in-the-loop tools.
+        #   delegate    - a meta-tool that runs a nested engine as a sub-task.
+        #   stream      - print the model's reply token-by-token as it arrives.
+        self._parallel = parallel
+        self._max_parallel = max_parallel
+        self.human_input = human_input
+        self.delegate = delegate
+        self.stream = stream
         self._reflections = 0
         self.last_task_id: Optional[str] = None
         self._last_store: Optional[StateStore] = None
@@ -153,8 +170,11 @@ class Engine:
                     })
 
             # ---- PHASE 5: measure the model call ----
+            # Phase 8: if streaming is on AND the model yields deltas, print
+            # them live and assemble the final message here. A non-streaming
+            # model (or stream=False) takes the simple branch.
             m_start = time.perf_counter()
-            resp = self.model.chat(messages, tools=self.registry.specs())
+            resp = self._call_model(messages)
             m_end = time.perf_counter()
             usage = getattr(resp, "usage", None) or {}
             p_tok = int(usage.get("prompt_tokens", 0))
@@ -215,8 +235,76 @@ class Engine:
             if self.backpressure is not None:
                 self.backpressure.clear()
 
+            # ===== PHASE 8: split this turn's tool calls into three passes =====
+            # PASS 1 (GATE, sequential): decide admission for every call. This
+            # is cheap and ORDERED, so the model sees a stable story. Two kinds
+            # of call short-circuit here and never reach the executor:
+            #   * human-in-the-loop  -> pause and ask a person
+            #   * sub-task delegation -> run a nested engine
+            # The remaining calls pass guardrail / circuit / backpressure gates.
+            admitted: list[ToolCall] = []
             for tc in resp.tool_calls:
                 print(f"model calls tool: {tc.name}({tc.arguments})")
+                tool = self.registry.get(tc.name)
+
+                # ---- HUMAN-IN-THE-LOOP (Phase 8) ----
+                # The model asked a person. We PAUSE the autonomous loop, get
+                # the answer from the callback, and feed it back as the result.
+                # This is the whole point of "human in the loop": the agent does
+                # not just run tools, it knows when to stop and ask.
+                if tool is not None and getattr(tool, "human", False):
+                    answer = self._ask_human(tc)
+                    print(f"  [human] answered: {answer[:80]}")
+                    messages.append(Message(Role.TOOL, answer, tool_call_id=tc.id))
+                    if store:
+                        store.append(task_id, "tool_result", {
+                            "id": tc.id, "name": tc.name, "ok": True,
+                            "output": answer, "human": True})
+                        store.append(task_id, "message",
+                                     message_to_dict(messages[-1]))
+                    continue
+
+                # ---- SUB-TASK DELEGATION (Phase 8) ----
+                # The model delegated a piece of work. We run it in a nested
+                # engine (a leaf) and fold its final answer back in. Anything
+                # the sub-task did is hidden behind one TOOL message - clean
+                # hierarchical planning.
+                if self.delegate is not None and tc.name == self.delegate.tool_name:
+                    sub_prompt = (tc.arguments.get("sub_prompt")
+                                  or tc.arguments.get("prompt")
+                                  or str(tc.arguments))
+                    d_start = time.perf_counter()
+                    print(f"  [delegate] -> sub-task: {sub_prompt[:80]}")
+                    try:
+                        sub_answer = self.delegate.run(self, sub_prompt)
+                        d_end = time.perf_counter()
+                        self.tracer.span(f"delegate.{tc.name}", "delegate",
+                                         d_start, d_end,
+                                         {"sub_prompt": sub_prompt[:200],
+                                          "answer_len": len(sub_answer)},
+                                         status="ok")
+                        if store:
+                            store.append(task_id, "span", {
+                                "kind": "delegate", "name": f"delegate.{tc.name}",
+                                "sub_prompt": sub_prompt[:200], "status": "ok"})
+                        messages.append(Message(Role.TOOL, sub_answer,
+                                                tool_call_id=tc.id))
+                    except Exception as exc:  # delegation must never kill boss
+                        d_end = time.perf_counter()
+                        self.tracer.span(f"delegate.{tc.name}", "delegate",
+                                         d_start, d_end, {"error": str(exc)},
+                                         status="error")
+                        print(f"  [delegate] ERROR: {exc}")
+                        messages.append(Message(
+                            Role.TOOL,
+                            content=f"DELEGATE ERROR: {exc}", tool_call_id=tc.id))
+                    if store:
+                        store.append(task_id, "tool_result", {
+                            "id": tc.id, "name": tc.name, "ok": True,
+                            "output": messages[-1].content, "delegate": True})
+                        store.append(task_id, "message",
+                                     message_to_dict(messages[-1]))
+                    continue
 
                 # ---- PHASE 4 GUARDRAILS: one more check before we run ----
                 # A block is NON-FATAL: we record it and feed the model a
@@ -308,21 +396,25 @@ class Engine:
                                          message_to_dict(messages[-1]))
                         continue
 
-                # LAYER 1: the executor retries transient failures for us.
-                t_start = time.perf_counter()
-                result = self.executor.execute(tc, store=store, task_id=task_id)
-                t_end = time.perf_counter()
-                # ---- PHASE 5: measure the tool call (incl. any retries) ----
-                t_attrs = {"duration_ms": round((t_end - t_start) * 1000, 2),
-                           "tool": tc.name, "ok": result.ok,
-                           "attempts": result.attempts}
-                self.tracer.span(f"tool.{tc.name}", "tool", t_start, t_end,
-                                 t_attrs, status="ok" if result.ok else "error")
-                if store:
-                    store.append(task_id, "span", {
-                        "kind": "tool", "name": tc.name,
-                        **t_attrs, "status": "ok" if result.ok else "error",
-                    })
+                admitted.append(tc)
+
+            # PASS 2 (EXECUTE, possibly parallel): run every admitted call.
+            # execute_calls records each tool span + tool_attempt events from
+            # its worker thread; results are keyed by tool_call id.
+            if admitted:
+                results = execute_calls(
+                    self.executor, admitted, store=store, task_id=task_id,
+                    tracer=self.tracer, parallel=self._parallel,
+                    max_parallel=self._max_parallel)
+            else:
+                results = {}
+
+            # PASS 3 (COMMIT, main thread): fold each result back into the
+            # conversation in the original call order, update the breaker, and
+            # persist. Single-writer here keeps the durable log consistent.
+            for tc in admitted:
+                result = results[tc.id]
+
                 # ---- PHASE 7: update the per-tool circuit breaker ----
                 # We count a failure only AFTER the executor's retries are
                 # exhausted (builds on P3). When the breaker trips OPEN we also
@@ -369,6 +461,60 @@ class Engine:
             "rate_limiter": self.rate_limiter.stats() if self.rate_limiter else None,
             "backpressure": self.backpressure.stats() if self.backpressure else None,
         }
+
+    def orchestration_report(self) -> dict:
+        """Snapshot of the Phase 8 orchestration features for this engine."""
+        human_tools = [n for n, t in self.registry._tools.items()
+                       if getattr(t, "human", False)]
+        return {
+            "parallel": self._parallel,
+            "max_parallel": self._max_parallel,
+            "human_in_the_loop": bool(human_tools),
+            "human_tools": human_tools,
+            "delegate": self.delegate.tool_name if self.delegate else None,
+            "stream": self.stream,
+        }
+
+    # -------------------------------------------------------------------- streaming
+    def _call_model(self, messages: list[Message]) -> Message:
+        """Get the next assistant message, streaming if enabled.
+
+        When ``stream`` is on we pull deltas from ``model.chat_stream`` and print
+        them live; the final Message is assembled from the deltas (the LAST
+        delta supplies ``tool_calls`` + ``usage``). When off, a plain
+        ``model.chat`` is used. Either way the rest of the loop is identical."""
+        if not self.stream or not hasattr(self.model, "chat_stream"):
+            return self.model.chat(messages, tools=self.registry.specs())
+        parts: list[str] = []
+        last = None
+        for delta in self.model.chat_stream(messages, tools=self.registry.specs()):
+            if delta.content:
+                sys.stdout.write(delta.content)
+                sys.stdout.flush()
+                parts.append(delta.content)
+            last = delta
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        return Message(
+            Role.ASSISTANT, "".join(parts),
+            tool_calls=list(last.tool_calls) if last else [],
+            usage=last.usage if last else None,
+        )
+
+    # -------------------------------------------------------------------- human I/O
+    def _ask_human(self, tc: ToolCall) -> str:
+        """Pause for a human answer to a human-in-the-loop tool call.
+
+        The prompt is pulled from the call's arguments (``question``/``prompt``),
+        falling back to the raw args. If no ``human_input`` callback was wired
+        in, we return a structured 'unavailable' result so the agent degrades
+        gracefully instead of crashing."""
+        prompt = (tc.arguments.get("question") or tc.arguments.get("prompt")
+                  or str(tc.arguments))
+        if self.human_input is None:
+            return (f"HUMAN INPUT UNAVAILABLE: no human_input callback is "
+                    f"configured for tool '{tc.name}'.")
+        return str(self.human_input(prompt, tc.arguments))
     def export_trace(self, task_id: Optional[str] = None,
                      fmt: str = "text") -> dict:
         """Return the trace for a task: spans + summary, optionally rendered.
@@ -387,7 +533,8 @@ class Engine:
             t.record(s)
         out = {"task_id": task_id, "summary": t.summary(),
                "spans": [s.to_dict() for s in spans],
-               "resilience": self.resilience_report()}
+               "resilience": self.resilience_report(),
+               "orchestration": self.orchestration_report()}
         if fmt == "text":
             sm = t.summary()
             head = (f"TRACE task={task_id}  model_calls={sm['model_calls']} "
