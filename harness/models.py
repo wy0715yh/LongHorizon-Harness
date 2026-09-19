@@ -10,6 +10,7 @@ one file.
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 
 from .types import Message, Role, ToolCall, ToolSpec
@@ -97,3 +98,107 @@ class DummyModel(Model):
         if last is not None:
             last.tool_calls = resp.tool_calls
             last.usage = resp.usage
+
+
+# --------------------------------------------------------------------------- #
+# OpenAI-compatible client (stdlib urllib, ZERO third-party dependencies).
+#
+# This is the piece the roadmap always promised but was never written. It makes
+# the "swap the model, the engine doesn't change" story REAL: the Engine depends
+# only on the ``Model`` interface, so pointing it at a real LLM (OpenAI, vLLM,
+# Ollama, a local server, or any national-cloud model that speaks the same
+# schema) is a one-line construction change - no engine edits. We use urllib so
+# the "zero third-party dependency" claim holds all the way to production.
+# --------------------------------------------------------------------------- #
+def _to_oai(m: Message) -> dict:
+    """Our Message -> OpenAI chat schema. ``Role`` mirrors the schema 1:1, so
+    this is mostly field reshaping. A TOOL message must carry its ``tool_call_id``;
+    an ASSISTANT message that only issues tool calls sends ``content=None``."""
+    content = m.content
+    if m.role == Role.ASSISTANT and m.tool_calls and not content:
+        content = None
+    d: dict = {"role": m.role.value, "content": content}
+    if m.role == Role.TOOL:
+        d["tool_call_id"] = m.tool_call_id
+    if m.tool_calls:
+        d["tool_calls"] = [
+            {"id": tc.id, "type": "function",
+             "function": {"name": tc.name,
+                          "arguments": json.dumps(tc.arguments, ensure_ascii=False)}}
+            for tc in m.tool_calls
+        ]
+    return d
+
+
+def _from_oai(msg: dict) -> Message:
+    """OpenAI chat message -> our Message. ``arguments`` arrives as a JSON
+    string; we parse it (falling back to {} on malformed input) so the engine
+    gets a real dict to pass to the tool."""
+    tcs = []
+    for tc in msg.get("tool_calls", []) or []:
+        fn = tc.get("function", {})
+        raw = fn.get("arguments", "{}")
+        try:
+            arguments = json.loads(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            arguments = {}
+        tcs.append(ToolCall(id=tc["id"], name=fn.get("name", ""),
+                            arguments=arguments or {}))
+    return Message(role=Role(msg.get("role", "assistant")),
+                   content=msg.get("content") or "", tool_calls=tcs)
+
+
+class OpenAICompatibleModel(Model):
+    """Talk to any OpenAI-compatible ``/chat/completions`` endpoint over urllib.
+
+    Stdlib only. The Engine already depends solely on the ``Model`` interface,
+    so wiring a real backend is just ``Engine(OpenAICompatibleModel(...), ...)`` -
+    no other change. ``chat`` parses usage into ``Message.usage`` (Phase 5 cost).
+    """
+
+    def __init__(self, api_key: str, base_url: str, model: str,
+                 temperature: float = 0.7, timeout: float = 60.0):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.temperature = temperature
+        self.timeout = timeout
+
+    def chat(self, messages: list[Message], tools=None,
+             temperature: float = 0.7) -> Message:
+        import json
+        import urllib.error
+        import urllib.request
+        payload = {
+            "model": self.model,
+            "messages": [_to_oai(m) for m in messages],
+            "temperature": temperature,
+        }
+        if tools:
+            payload["tools"] = [{
+                "type": "function",
+                "function": {"name": t.name, "description": t.description,
+                             "parameters": t.parameters},
+            } for t in tools]
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}/chat/completions", data=data,
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {self.api_key}"},
+            method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:  # surface a readable error, not a traceback
+            detail = e.read().decode("utf-8", "replace")[:300]
+            raise RuntimeError(f"LLM HTTP {e.code}: {detail}") from e
+        msg = body["choices"][0]["message"]
+        out = _from_oai(msg)
+        out.usage = body.get("usage") or None
+        return out
+
+    def chat_stream(self, messages, tools=None, temperature=0.7):
+        """urllib has no first-class SSE reader; yield one full delta so the
+        engine's streaming path still works. A real deployment can swap in a
+        streaming client - the Engine only needs the LAST delta's tool_calls."""
+        yield self.chat(messages, tools=tools, temperature=temperature)

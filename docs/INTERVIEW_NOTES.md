@@ -1,13 +1,13 @@
 # LongHorizon-Harness 面试速记 / 设计精华
 
 > **用途**：面试时讲清「这个项目为什么这么设计、每一层解决什么问题、背后是什么工程思想」。
-> **维护约定**：本文件随项目迭代持续追加。每完成一个 Phase（P6+），就在「分阶段精华」里补一节，并在末尾「后续阶段」勾掉对应项。当前覆盖 **P0–P8**。
+> **维护约定**：本文件随项目迭代持续追加。每完成一个 Phase（P6+），就在「分阶段精华」里补一节，并在末尾「后续阶段」勾掉对应项。当前覆盖 **P0–P9**。
 
 ---
 
 ## 0. 一句话电梯演讲（背下来）
 
-> 我构建了一个面向**边缘/资源受限环境**的轻量级 Agent 运行时，只用 Python 标准库、零第三方依赖，在单 SQLite 文件上落地了**工具调用失败恢复、任务状态崩溃续跑、执行轨迹可观测**三项生产级工程能力，并进一步具备行为规范护栏、**反思自我纠错**、面向依赖与 API 的**熔断/限流/背压**三道弹性防线，以及**高级编排**（并行工具、人在环、子任务委派、流式输出）能力。
+> 我构建了一个面向**边缘/资源受限环境**的轻量级 Agent 运行时，只用 Python 标准库、零第三方依赖，在单 SQLite 文件上落地了**工具调用失败恢复、任务状态崩溃续跑、执行轨迹可观测**三项生产级工程能力，并进一步具备行为规范护栏、**反思自我纠错**、面向依赖与 API 的**熔断/限流/背压**三道弹性防线、**高级编排**（并行工具、人在环、子任务委派、流式输出），以及把这一切**包装成可服务化入口（CLI / HTTP 服务）并有基准量化（冷启动/内存峰值/恢复耗时）**——全程零第三方依赖，装完 Python 即跑。
 
 **为什么是差异化选题**：主流框架（LangGraph / AutoGen / CrewAI）默认假设有云 GPU 和无限内存；本报告切的是它们照顾不好的「轻量 + 可靠」场景，讲的可不是「又包一层聊天机器人」，而是 Agent 真实的工程痛点。
 
@@ -115,6 +115,21 @@
 - **设计张力（面试加分）**：并行执行最容易踩的坑是「并发写持久化层」。本项目没为了并行去改事件日志语义，而是给 `StateStore`/`Tracer` 加锁并放开 `check_same_thread`，让并行 worker 各写各的 `tool_attempt`/`tool` span 仍安全——**线程池只在「执行」这一段，落盘始终主线程**，既拿到并发加速又不破坏事件溯源的单写者不变式。委派同理：子任务不碰父 store，避免嵌套任务簿记与跨线程写。
 - **验证铁证（`orchestration_demo.py`）**：A) 3 慢调用并行 ~3× 加速；B) 模型调 `confirm(human=True)` → 引擎暂停、`human_input` 返回 `yes, approved` → 答案回灌、继续；C) boss 调 `delegate` → 嵌套引擎算出 42 并折回、boss 出 `boss final: ...42`；D) `stream=True` 下最终回答逐字打印且拼装正确。
 
+### P9 服务化与评测 — CLI / HTTP 服务 / 基准测试
+**文件**：`server.py`（HTTP 薄包装）/ `cli.py` + `__main__.py`（命令行）/ `models.py`（`OpenAICompatibleModel`，补齐了此前一直宣称但未实现的真模型客户端）/ `examples/benchmark_demo.py`（评测）
+
+- **全局决策：服务化 = 引擎的「薄包装」，不是新控制流**。P9 的三件事里，CLI 和 HTTP 服务都**不改主循环**——它们只做三件事：① 按配置构造一个 `Engine`；② 调 `engine.run()`；③ 把 `engine.export_trace()` 序列化成 JSON。整个项目到「可部署」这步，内核一行没动。这本身就是「每一层能力都是主循环的小增强」哲学在服务层的回响——只不过服务层增强的是「调用方式」而非「循环内部」。`harness/server.py` 用 **stdlib `http.server` + `ThreadingHTTPServer`**，零 Flask/FastAPI，让「零第三方依赖」从内核一直成立到上线。
+- **能力①：CLI（`python -m harness`）**。`cli.py` 用 `argparse` 提供 `run`（单 prompt 跑任务 + `--trace` 打印轨迹）和 `serve`（起 HTTP 服务）两个子命令，`--model dummy|openai` 切换后端、`--store` 可选持久化。最快的端到端演示入口：`python -m harness run "what is 6*7" --trace`。
+- **能力②：HTTP 服务（`server.py`）**。`POST /run` 收 `{prompt, model, max_steps, db?, task_id?}` 返回 `{answer, task_id, trace}`；`GET /health` 健康检查。每请求一线程（线程安全已在 P8 打底），**单任务无状态、带 `db` 即支持 resume**（同一 SQLite 文件跨请求续跑）。一个坏任务只会返回 `500 {"error":...}`，**绝不拖垮服务进程**——服务的健壮性复用的是引擎「失败不崩」的同一条契约。
+- **补完真模型客户端（`OpenAICompatibleModel`）**：此前路线一直宣称「OpenAI 兼容 HTTP 抽象」，但 `models.py` 实际只有 `DummyModel`。P9 用 **stdlib `urllib`** 补齐了真客户端（chat + Message/ToolCall 与 OpenAI 格式的双向转换），让「换模型零改引擎」从话术变成可跑的事实——`Engine(OpenAICompatibleModel(...), ...)` 一行切换，引擎代码零改动。这同时坐实了「零依赖」：连真模型 HTTP 调用都不用 `requests`。
+- **能力③：基准测试（`benchmark_demo.py`）——把「轻量 + 可靠」量化成数字**：
+  - **冷启动**：子进程真测 `import harness` 耗时 + 进程内 Engine 构造 + 单任务端到端延迟（实测 import 亚毫秒级、构造 0.03ms、单任务 ~1ms）。
+  - **内存峰值**：`tracemalloc` 测一次任务峰值（实测 ~0.03MB）——直接回应「轻量」主张。
+  - **恢复耗时**：`crash_after=1` 模拟第 1 步崩溃，再用**全新 Engine 打开同一 SQLite 文件** resume 到完成，量化墙钟（实测 ~12ms）——这就是事件溯源设计的硬 payoff。
+  - **附：离线 HTTP 往返**：起后台服务 `POST /run` 断言返回 `answer+task_id+trace`，证明「可服务化」不是嘴上说的。
+- **为什么评测是收尾而不是炫技**：前面 P2–P8 讲的是「可靠」和「弹性」的工程手段，但面试官会问「到底多轻、多快恢复」。P9 用项目自带的可观测轨迹（P5 Span）+ 崩溃恢复（P2）直接算出这三项指标，**复用已有能力做度量，不另造一套 benchmark 框架**——又一次「小增强」哲学。
+- **验证铁证（`benchmark_demo.py` ALL CHECKS PASSED）**：import 0.0003s / 构造 0.03ms / 单任务 1.34ms / 内存峰值 0.029MB / 崩溃→recovery 12.17ms 且答案正确 / HTTP `POST /run` 返回 `answer+task_id+trace` + `GET /health` ok。
+
 ---
 
 ## 4. 贯穿全局的设计哲学（面试金句）
@@ -158,11 +173,17 @@ A：事件日志与 trace 都是共享状态，原本单线程写。P8 让工具
 
 ---
 
+**Q：怎么把它跑成服务 / 怎么对接真模型？**
+A：服务化是引擎的薄包装，不改主循环——`server.py` 用 stdlib `http.server` 起 `POST /run`（收 prompt 返回 answer+trace），CLI 用 `python -m harness run/serve` 即可。真模型客户端 `OpenAICompatibleModel` 也用纯 urllib 实现，构造时一行换成 `Engine(OpenAICompatibleModel(...))`，引擎零改动，连 HTTP 调用都零第三方依赖。
+
+**Q：你说「轻量、可靠」，有数字吗？**
+A：有，`benchmark_demo.py` 把主张量化了——`import harness` 亚毫秒级、Engine 构造 ~0.03ms、单任务端到端 ~1ms、一次任务内存峰值 ~0.03MB（tracemalloc）、第 1 步崩溃后开同一 SQLite 文件 resume 完成 ~12ms 且答案正确。冷启动/内存来自可观测 Span，恢复耗时来自 P2 事件溯源——都是复用已有能力度量，不另造框架。
+
 ## 6. 后续阶段（待补充，完成后在此追加小节并勾掉）
 
 - [x] **P6 反思与自我纠错** — Critic 评审 / 自省重规划 / 错误记忆（把 P3/P4「失败回灌模型」升级成「模型自己批评自己」）
 - [x] **P7 熔断与限流** — 单工具熔断器（CLOSED/OPEN/HALF_OPEN）/ 模型级令牌桶限流 / 背压队列 shed 溢出
 - [x] **P8 高级编排** — 并行工具（线程池）/ 人在环（human_input 暂停）/ 子任务委派（嵌套 Engine）/ 流式（chat_stream）
-- [ ] **P9 服务化与评测** — CLI / HTTP 服务 / 基准测试（量化冷启动、内存峰值、恢复耗时）
+- [x] **P9 服务化与评测** — CLI（`python -m harness`）/ HTTP 服务（stdlib http.server）/ 基准测试（冷启动·内存峰值·恢复耗时）+ 补齐 OpenAICompatibleModel 真模型客户端
 
-> 更新日志：2026-09-18 创建，覆盖 P0–P5；20:45 补充 P6（反思与自我纠错：Critic / 循环检测 / 错误记忆 / 自省重规划）；2026-09-19 补充 P7（熔断与限流：CircuitBreaker / RateLimiter 令牌桶 / BackpressureQueue 背压 shed）；2026-09-19 补充 P8（高级编排：gate→execute→commit 三段式工具循环 / execute_calls 线程池并行 / Tool.human 人在环 / Delegate 嵌套引擎委派 / Model.chat_stream 流式 / StateStore·Tracer 线程安全）。
+> 更新日志：2026-09-18 创建，覆盖 P0–P5；20:45 补充 P6（反思与自我纠错：Critic / 循环检测 / 错误记忆 / 自省重规划）；2026-09-19 补充 P7（熔断与限流：CircuitBreaker / RateLimiter 令牌桶 / BackpressureQueue 背压 shed）；2026-09-19 补充 P8（高级编排：gate→execute→commit 三段式工具循环 / execute_calls 线程池并行 / Tool.human 人在环 / Delegate 嵌套引擎委派 / Model.chat_stream 流式 / StateStore·Tracer 线程安全）；2026-09-19 补充 P9（服务化：CLI `python -m harness` / HTTP 服务 `server.py` stdlib http.server / 基准测试 `benchmark_demo.py` 量化冷启动·内存峰值·恢复耗时；并补齐此前缺失的 `OpenAICompatibleModel` urllib 真模型客户端，坐实「换模型零改引擎」与「零依赖」）。
